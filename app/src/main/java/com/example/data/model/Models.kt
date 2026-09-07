@@ -84,7 +84,8 @@ data class TimelineState(
     val headlineHook: String = "",
     val activeCaptionStyle: CaptionStylePreset = CaptionStylePreset.HORMOZI_YELLOW,
     val canvasRatio: String = "9:16",
-    val masterVolume: Float = 1.0f
+    val masterVolume: Float = 1.0f,
+    val sourceVideoUri: String = ""
 ) {
     val totalDurationMs: Long get() = videoSegments.sumOf { it.durationMs }.coerceAtLeast(1000L)
 }
@@ -103,7 +104,8 @@ data class DiscoveredClip(
     val aiExplanation: String,
     val hookQuote: String,
     val recommendedStyle: CaptionStylePreset = CaptionStylePreset.HORMOZI_YELLOW,
-    val thumbnailGradientIndex: Int = 0
+    val thumbnailGradientIndex: Int = 0,
+    val sourceVideoUri: String = ""
 ) {
     val durationSec: Int get() = ((endMs - startMs) / 1000).toInt()
 }
@@ -116,6 +118,7 @@ data class CreatorProject(
     val targetPlatform: PlatformTarget = PlatformTarget.TIKTOK,
     val clipsCount: Int = 0,
     val status: String = "READY",
+    val videoUri: String = "",
     val createdAt: Long = System.currentTimeMillis()
 )
 

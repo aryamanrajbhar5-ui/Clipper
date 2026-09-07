@@ -16,7 +16,7 @@ import kotlinx.coroutines.launch
         TimelineEntity::class,
         ExportJobEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -35,7 +35,8 @@ abstract class AppDatabase : RoomDatabase() {
                     context.applicationContext,
                     AppDatabase::class.java,
                     "ai_clipper_factory.db"
-                ).addCallback(object : Callback() {
+                ).fallbackToDestructiveMigration()
+                .addCallback(object : Callback() {
                     override fun onCreate(db: SupportSQLiteDatabase) {
                         super.onCreate(db)
                         // Seed initial demo project

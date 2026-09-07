@@ -12,6 +12,7 @@ data class ProjectEntity(
     val targetPlatform: String,
     val clipsCount: Int,
     val status: String,
+    val videoUri: String = "",
     val createdAt: Long
 )
 
@@ -30,7 +31,8 @@ data class ClipEntity(
     val aiExplanation: String,
     val hookQuote: String,
     val recommendedStyle: String,
-    val thumbnailGradientIndex: Int
+    val thumbnailGradientIndex: Int,
+    val sourceVideoUri: String = ""
 )
 
 @Entity(tableName = "timelines")

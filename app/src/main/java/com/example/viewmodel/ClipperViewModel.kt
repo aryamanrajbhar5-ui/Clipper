@@ -171,11 +171,12 @@ class ClipperViewModel(application: Application) : AndroidViewModel(application)
         videoTitle: String,
         durationSec: Int,
         targetPlatform: PlatformTarget,
-        userPrompt: String = ""
+        userPrompt: String = "",
+        videoUri: String = ""
     ) {
         viewModelScope.launch {
             _isScanningClips.value = true
-            val project = repository.createProject(title, videoTitle, durationSec, targetPlatform)
+            val project = repository.createProject(title, videoTitle, durationSec, targetPlatform, videoUri)
             _selectedProject.value = project
             _currentSection.value = AppSection.CLIP_FINDER
 
@@ -469,7 +470,7 @@ class ClipperViewModel(application: Application) : AndroidViewModel(application)
     }
 
     // Exporting
-    fun startExport(resolution: String = "1080x1920 (9:16)", fps: Int = 60) {
+    fun startExport(resolution: String = "1080x1920 (9:16)", fps: Int = 30) {
         val project = _selectedProject.value ?: return
         val clip = _selectedClip.value ?: return
         viewModelScope.launch {
@@ -477,10 +478,17 @@ class ClipperViewModel(application: Application) : AndroidViewModel(application)
             _exportProgress.value = 0f
             _exportStatusText.value = "Starting MP4 Render..."
 
+            val effectiveSourceUri = when {
+                _timelineState.value.sourceVideoUri.isNotBlank() -> _timelineState.value.sourceVideoUri
+                clip.sourceVideoUri.isNotBlank() -> clip.sourceVideoUri
+                else -> project.videoUri
+            }
+
             val job = repository.startExport(
                 projectId = project.id,
                 clipTitle = clip.title,
                 timeline = _timelineState.value,
+                sourceUriOrPath = effectiveSourceUri,
                 resolution = resolution,
                 fps = fps
             ) { status, progress ->
@@ -496,7 +504,11 @@ class ClipperViewModel(application: Application) : AndroidViewModel(application)
             }
 
             _isExporting.value = false
-            showNotice("Export complete! File saved: ${job.resolution}")
+            if (job.status == com.example.data.model.ExportStatus.COMPLETED) {
+                showNotice("Export complete! File saved: ${job.outputFilePath}")
+            } else {
+                showNotice("Export finished with status: ${job.status.name}")
+            }
         }
     }
 

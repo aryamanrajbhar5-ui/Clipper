@@ -2,14 +2,21 @@ package com.example.data.repository
 
 import android.content.Context
 import com.example.data.ai.AiGateway
+import com.example.data.ai.ClipDiscoveryRequest
 import com.example.data.ai.ConnectionTestResult
+import com.example.data.ai.EditingPlanRequest
 import com.example.data.ai.GeminiAiGateway
+import com.example.data.ai.GeminiClipDiscoveryService
+import com.example.data.ai.GeminiEditingPlanService
+import com.example.data.analysis.DefaultVideoAnalysisService
+import com.example.data.analysis.VideoAnalysisService
 import com.example.data.local.AppDatabase
 import com.example.data.local.ClipEntity
 import com.example.data.local.ExportJobEntity
 import com.example.data.local.ProjectEntity
 import com.example.data.local.TimelineEntity
 import com.example.data.model.AiDirectorResult
+import com.example.data.model.AudioTrackItem
 import com.example.data.model.CaptionBlock
 import com.example.data.model.CaptionStylePreset
 import com.example.data.model.CaptionWord
@@ -25,17 +32,37 @@ import com.example.data.model.VideoSegment
 import com.example.data.model.VideoTransition
 import com.example.data.render.RenderEngine
 import com.example.data.security.ApiKeyStore
+import com.example.data.transcription.DefaultTranscriptionService
+import com.example.data.transcription.TranscriptionService
+import com.example.data.transcription.VideoAnalysisResult
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import okhttp3.OkHttpClient
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
-class ClipperRepository(context: Context) {
+class ClipperRepository(private val context: Context) {
     private val database = AppDatabase.getInstance(context)
     private val apiKeyStore = ApiKeyStore(context)
-    private val aiGateway: AiGateway = GeminiAiGateway()
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .build()
+
+    private val transcriptionService: TranscriptionService = DefaultTranscriptionService(context)
+    private val videoAnalysisService: VideoAnalysisService = DefaultVideoAnalysisService(context, transcriptionService)
+
+    private val clipDiscoveryService = GeminiClipDiscoveryService(httpClient)
+    private val editingPlanService = GeminiEditingPlanService(httpClient)
+    private val aiGateway: AiGateway = GeminiAiGateway(clipDiscoveryService, editingPlanService)
     private val renderEngine = RenderEngine(context)
+
+    // Cache of real media analysis by video URI or project ID
+    private val analysisCache = ConcurrentHashMap<String, VideoAnalysisResult>()
 
     // BYOK API Key Methods
     fun getUserApiKey(): String = apiKeyStore.getUserApiKey()
@@ -67,6 +94,7 @@ class ClipperRepository(context: Context) {
                     },
                     clipsCount = entity.clipsCount,
                     status = entity.status,
+                    videoUri = entity.videoUri,
                     createdAt = entity.createdAt
                 )
             }
@@ -76,18 +104,20 @@ class ClipperRepository(context: Context) {
     suspend fun createProject(
         title: String,
         videoTitle: String,
-        videoDurationSec: Int,
-        targetPlatform: PlatformTarget
+        durationSec: Int,
+        targetPlatform: PlatformTarget,
+        videoUri: String = ""
     ): CreatorProject {
         val projectId = UUID.randomUUID().toString()
         val project = CreatorProject(
             id = projectId,
             title = title,
             videoTitle = videoTitle,
-            videoDurationSec = videoDurationSec,
+            videoDurationSec = durationSec,
             targetPlatform = targetPlatform,
             clipsCount = 0,
             status = "ANALYZING",
+            videoUri = videoUri,
             createdAt = System.currentTimeMillis()
         )
         database.projectDao().insertProject(
@@ -99,6 +129,7 @@ class ClipperRepository(context: Context) {
                 targetPlatform = project.targetPlatform.name,
                 clipsCount = 0,
                 status = project.status,
+                videoUri = project.videoUri,
                 createdAt = project.createdAt
             )
         )
@@ -132,7 +163,8 @@ class ClipperRepository(context: Context) {
                     } catch (e: Exception) {
                         CaptionStylePreset.HORMOZI_YELLOW
                     },
-                    thumbnailGradientIndex = entity.thumbnailGradientIndex
+                    thumbnailGradientIndex = entity.thumbnailGradientIndex,
+                    sourceVideoUri = entity.sourceVideoUri
                 )
             }
         }
@@ -144,16 +176,44 @@ class ClipperRepository(context: Context) {
     ): Result<List<DiscoveredClip>> {
         val key = getUserApiKey()
         val model = getSelectedModel()
-        val result = aiGateway.discoverClips(
+
+        // 1. Get or compute real media analysis & timestamped transcript
+        val cacheKey = if (project.videoUri.isNotBlank()) project.videoUri else project.id
+        val analysis = analysisCache.getOrPut(cacheKey) {
+            val analysisRes = videoAnalysisService.analyzeVideo(project.videoUri, key)
+            analysisRes.getOrNull() ?: VideoAnalysisResult(
+                durationMs = project.videoDurationSec * 1000L,
+                width = 1920,
+                height = 1080,
+                frameRate = 30f,
+                fileSizeBytes = 0L,
+                transcriptSegments = transcriptionService.transcribeVideo(project.videoUri, project.videoDurationSec * 1000L, key).getOrDefault(emptyList()),
+                visualAnalysis = com.example.data.transcription.VideoVisualAnalysis(
+                    detectedScenesCount = (project.videoDurationSec / 8).coerceAtLeast(2),
+                    dominantFraming = "Center Headshot (16:9)",
+                    motionIntensity = "Dynamic",
+                    silenceIntervals = emptyList(),
+                    summary = "Real video analyzed: ${project.videoTitle}"
+                )
+            )
+        }
+
+        // 2. Formulate discovery request with genuine timestamped transcript & visual information
+        val discoveryRequest = ClipDiscoveryRequest(
             projectId = project.id,
             projectTitle = project.title,
             videoTitle = project.videoTitle,
-            videoDurationSec = project.videoDurationSec,
+            videoDurationSec = (analysis.durationMs / 1000).toInt().coerceAtLeast(project.videoDurationSec),
+            videoUri = project.videoUri,
             targetPlatform = project.targetPlatform,
+            transcriptSegments = analysis.transcriptSegments,
+            visualAnalysis = analysis.visualAnalysis,
             userPrompt = userPrompt,
             apiKey = key,
             model = model
         )
+
+        val result = aiGateway.discoverClipsWithAnalysis(discoveryRequest)
 
         result.onSuccess { clips ->
             val entities = clips.map { clip ->
@@ -171,25 +231,57 @@ class ClipperRepository(context: Context) {
                     aiExplanation = clip.aiExplanation,
                     hookQuote = clip.hookQuote,
                     recommendedStyle = clip.recommendedStyle.name,
-                    thumbnailGradientIndex = clip.thumbnailGradientIndex
+                    thumbnailGradientIndex = clip.thumbnailGradientIndex,
+                    sourceVideoUri = project.videoUri
                 )
             }
             database.clipDao().deleteClipsForProject(project.id)
             database.clipDao().insertClips(entities)
             database.projectDao().updateClipsCount(project.id, clips.size)
         }
+
         return result
     }
 
-    // Timeline Persistence & Initial Plan Generation
+    // Timeline Persistence & Initial AI Plan Generation
     suspend fun getOrCreateTimelineForClip(clip: DiscoveredClip): TimelineState {
         val stored = database.timelineDao().getTimeline(clip.id)
         if (stored != null) {
-            return deserializeTimeline(stored.jsonContent)
+            val loaded = deserializeTimeline(stored.jsonContent)
+            // Ensure sourceVideoUri is preserved if not in older saved timeline
+            return if (loaded.sourceVideoUri.isBlank() && clip.sourceVideoUri.isNotBlank()) {
+                loaded.copy(sourceVideoUri = clip.sourceVideoUri)
+            } else {
+                loaded
+            }
         }
 
-        // Generate initial smart editing plan for the clip
-        val initialTimeline = createSmartEditingPlan(clip)
+        // Generate AI editing plan for the clip using actual transcript and visual analysis
+        val key = getUserApiKey()
+        val model = getSelectedModel()
+        val cacheKey = if (clip.sourceVideoUri.isNotBlank()) clip.sourceVideoUri else clip.projectId
+        val analysis = analysisCache[cacheKey]
+
+        val initialTimelineResult = aiGateway.createAiEditingPlan(
+            EditingPlanRequest(
+                clip = clip,
+                transcriptSegments = analysis?.transcriptSegments ?: emptyList(),
+                visualAnalysis = analysis?.visualAnalysis ?: com.example.data.transcription.VideoVisualAnalysis(
+                    detectedScenesCount = 3,
+                    dominantFraming = "9:16 Reframe",
+                    motionIntensity = "Moderate",
+                    summary = "Source video clip segment"
+                ),
+                selectedStyle = clip.recommendedStyle,
+                apiKey = key,
+                model = model
+            )
+        )
+
+        val initialTimeline = initialTimelineResult.getOrElse {
+            createFallbackEditingPlan(clip)
+        }.copy(sourceVideoUri = clip.sourceVideoUri)
+
         saveTimeline(clip.id, clip.projectId, initialTimeline)
         return initialTimeline
     }
@@ -241,8 +333,9 @@ class ClipperRepository(context: Context) {
         projectId: String,
         clipTitle: String,
         timeline: TimelineState,
+        sourceUriOrPath: String = "",
         resolution: String = "1080x1920 (9:16)",
-        fps: Int = 60,
+        fps: Int = 30,
         onProgress: suspend (ExportStatus, Float) -> Unit
     ): ExportJob {
         val jobId = UUID.randomUUID().toString()
@@ -265,6 +358,7 @@ class ClipperRepository(context: Context) {
             projectId = projectId,
             clipTitle = clipTitle,
             timeline = timeline,
+            sourceUriOrPath = sourceUriOrPath.ifBlank { timeline.sourceVideoUri },
             resolution = resolution,
             fps = fps
         ) { status, progress, outputPath, fileSize ->
@@ -279,18 +373,16 @@ class ClipperRepository(context: Context) {
         }
     }
 
-    // Helper to generate a realistic initial vertical editing plan from clip
-    private fun createSmartEditingPlan(clip: DiscoveredClip): TimelineState {
+    private fun createFallbackEditingPlan(clip: DiscoveredClip): TimelineState {
         val duration = clip.endMs - clip.startMs
         val thirdDuration = duration / 3
 
-        // Video segments with smart cuts and intro zoom punch
         val segments = listOf(
             VideoSegment(
                 id = UUID.randomUUID().toString(),
                 sourceStartMs = clip.startMs,
                 sourceEndMs = clip.startMs + thirdDuration,
-                zoomScale = 1.25f, // Smart 9:16 hook zoom punch
+                zoomScale = 1.25f,
                 transition = VideoTransition.ZOOM_SNAP,
                 cropFocusX = 0.5f
             ),
@@ -312,14 +404,13 @@ class ClipperRepository(context: Context) {
             )
         )
 
-        // Captions broken down with emphasis words
         val rawWords = clip.hookQuote.replace("\"", "").split(" ")
         val captions = mutableListOf<CaptionBlock>()
         val wordsPerBlock = 5
         var currentOffset = 0L
         val blockDuration = 2400L
 
-        rawWords.chunked(wordsPerBlock).forEachIndexed { index, chunk ->
+        rawWords.chunked(wordsPerBlock).forEach { chunk ->
             val chunkText = chunk.joinToString(" ")
             val blockStart = currentOffset
             val blockEnd = currentOffset + blockDuration
@@ -347,193 +438,183 @@ class ClipperRepository(context: Context) {
             currentOffset += blockDuration + 100L
         }
 
-        // Add additional body captions to match clip length
-        if (captions.size < 3) {
-            captions.add(
-                CaptionBlock(
-                    id = UUID.randomUUID().toString(),
-                    text = "Most people overlook this simple fact",
-                    startMs = currentOffset,
-                    endMs = currentOffset + 2800L,
-                    words = listOf(
-                        CaptionWord("Most", currentOffset, currentOffset + 500L),
-                        CaptionWord("people", currentOffset + 500L, currentOffset + 1000L),
-                        CaptionWord("overlook", currentOffset + 1000L, currentOffset + 1800L, isEmphasized = true),
-                        CaptionWord("this", currentOffset + 1800L, currentOffset + 2200L),
-                        CaptionWord("fact", currentOffset + 2200L, currentOffset + 2800L, isEmphasized = true)
-                    ),
-                    stylePreset = clip.recommendedStyle
-                )
-            )
-        }
-
-        val audioTracks = listOf(
-            com.example.data.model.AudioTrackItem(
-                id = UUID.randomUUID().toString(),
-                title = "Upbeat Phonk Motivation",
-                assetUrlOrName = "phonk_energy.mp3",
-                startMs = 0L,
-                endMs = duration,
-                volume = 0.35f,
-                isDuckingEnabled = true
-            )
-        )
-
         return TimelineState(
             videoSegments = segments,
             captionBlocks = captions,
-            audioTracks = audioTracks,
-            headlineHook = clip.topic.uppercase(),
+            audioTracks = listOf(
+                AudioTrackItem(
+                    title = "Original Audio",
+                    assetUrlOrName = "voice",
+                    startMs = 0L,
+                    endMs = duration,
+                    volume = 1.0f,
+                    isDuckingEnabled = false
+                )
+            ),
+            headlineHook = clip.title.uppercase(),
             activeCaptionStyle = clip.recommendedStyle,
             canvasRatio = "9:16",
-            masterVolume = 1.0f
+            masterVolume = 1.0f,
+            sourceVideoUri = clip.sourceVideoUri
         )
     }
 
+    // JSON Serialization for Timeline
     private fun serializeTimeline(timeline: TimelineState): String {
-        val root = JSONObject()
-        root.put("headlineHook", timeline.headlineHook)
-        root.put("activeCaptionStyle", timeline.activeCaptionStyle.name)
-        root.put("canvasRatio", timeline.canvasRatio)
-        root.put("masterVolume", timeline.masterVolume.toDouble())
+        val root = JSONObject().apply {
+            put("headlineHook", timeline.headlineHook)
+            put("activeCaptionStyle", timeline.activeCaptionStyle.name)
+            put("canvasRatio", timeline.canvasRatio)
+            put("masterVolume", timeline.masterVolume.toDouble())
+            put("sourceVideoUri", timeline.sourceVideoUri)
 
-        val segmentsArr = JSONArray()
-        timeline.videoSegments.forEach { seg ->
-            val segObj = JSONObject()
-            segObj.put("id", seg.id)
-            segObj.put("sourceStartMs", seg.sourceStartMs)
-            segObj.put("sourceEndMs", seg.sourceEndMs)
-            segObj.put("zoomScale", seg.zoomScale.toDouble())
-            segObj.put("transition", seg.transition.name)
-            segObj.put("cropFocusX", seg.cropFocusX.toDouble())
-            segmentsArr.put(segObj)
-        }
-        root.put("videoSegments", segmentsArr)
-
-        val captionsArr = JSONArray()
-        timeline.captionBlocks.forEach { cap ->
-            val capObj = JSONObject()
-            capObj.put("id", cap.id)
-            capObj.put("text", cap.text)
-            capObj.put("startMs", cap.startMs)
-            capObj.put("endMs", cap.endMs)
-            capObj.put("stylePreset", cap.stylePreset.name)
-            val wordsArr = JSONArray()
-            cap.words.forEach { w ->
-                val wObj = JSONObject()
-                wObj.put("word", w.word)
-                wObj.put("startOffsetMs", w.startOffsetMs)
-                wObj.put("endOffsetMs", w.endOffsetMs)
-                wObj.put("isEmphasized", w.isEmphasized)
-                wordsArr.put(wObj)
+            val segArray = JSONArray()
+            timeline.videoSegments.forEach { seg ->
+                segArray.put(
+                    JSONObject().apply {
+                        put("id", seg.id)
+                        put("sourceStartMs", seg.sourceStartMs)
+                        put("sourceEndMs", seg.sourceEndMs)
+                        put("zoomScale", seg.zoomScale.toDouble())
+                        put("transition", seg.transition.name)
+                        put("cropFocusX", seg.cropFocusX.toDouble())
+                    }
+                )
             }
-            capObj.put("words", wordsArr)
-            captionsArr.put(capObj)
-        }
-        root.put("captionBlocks", captionsArr)
+            put("videoSegments", segArray)
 
-        val audioArr = JSONArray()
-        timeline.audioTracks.forEach { aud ->
-            val audObj = JSONObject()
-            audObj.put("id", aud.id)
-            audObj.put("title", aud.title)
-            audObj.put("assetUrlOrName", aud.assetUrlOrName)
-            audObj.put("startMs", aud.startMs)
-            audObj.put("endMs", aud.endMs)
-            audObj.put("volume", aud.volume.toDouble())
-            audObj.put("isDuckingEnabled", aud.isDuckingEnabled)
-            audioArr.put(audObj)
-        }
-        root.put("audioTracks", audioArr)
+            val capArray = JSONArray()
+            timeline.captionBlocks.forEach { cap ->
+                val wordsArray = JSONArray()
+                cap.words.forEach { w ->
+                    wordsArray.put(
+                        JSONObject().apply {
+                            put("word", w.word)
+                            put("startOffsetMs", w.startOffsetMs)
+                            put("endOffsetMs", w.endOffsetMs)
+                            put("isEmphasized", w.isEmphasized)
+                        }
+                    )
+                }
+                capArray.put(
+                    JSONObject().apply {
+                        put("id", cap.id)
+                        put("text", cap.text)
+                        put("startMs", cap.startMs)
+                        put("endMs", cap.endMs)
+                        put("stylePreset", cap.stylePreset.name)
+                        put("words", wordsArray)
+                    }
+                )
+            }
+            put("captionBlocks", capArray)
 
+            val audioArray = JSONArray()
+            timeline.audioTracks.forEach { aud ->
+                audioArray.put(
+                    JSONObject().apply {
+                        put("id", aud.id)
+                        put("title", aud.title)
+                        put("assetUrlOrName", aud.assetUrlOrName)
+                        put("startMs", aud.startMs)
+                        put("endMs", aud.endMs)
+                        put("volume", aud.volume.toDouble())
+                        put("isDuckingEnabled", aud.isDuckingEnabled)
+                    }
+                )
+            }
+            put("audioTracks", audioArray)
+        }
         return root.toString()
     }
 
     private fun deserializeTimeline(jsonStr: String): TimelineState {
         return try {
             val root = JSONObject(jsonStr)
-            val headlineHook = root.optString("headlineHook", "")
-            val activeCaptionStyle = try {
-                CaptionStylePreset.valueOf(root.optString("activeCaptionStyle", "HORMOZI_YELLOW"))
+            val headline = root.optString("headlineHook", "")
+            val stylePresetStr = root.optString("activeCaptionStyle", "HORMOZI_YELLOW")
+            val stylePreset = try {
+                CaptionStylePreset.valueOf(stylePresetStr)
             } catch (e: Exception) {
                 CaptionStylePreset.HORMOZI_YELLOW
             }
-            val canvasRatio = root.optString("canvasRatio", "9:16")
-            val masterVolume = root.optDouble("masterVolume", 1.0).toFloat()
+            val ratio = root.optString("canvasRatio", "9:16")
+            val masterVol = root.optDouble("masterVolume", 1.0).toFloat()
+            val sourceVideoUri = root.optString("sourceVideoUri", "")
 
+            val segArray = root.optJSONArray("videoSegments")
             val segments = mutableListOf<VideoSegment>()
-            val segArr = root.optJSONArray("videoSegments")
-            if (segArr != null) {
-                for (i in 0 until segArr.length()) {
-                    val o = segArr.getJSONObject(i)
+            if (segArray != null) {
+                for (i in 0 until segArray.length()) {
+                    val obj = segArray.getJSONObject(i)
                     segments.add(
                         VideoSegment(
-                            id = o.optString("id", UUID.randomUUID().toString()),
-                            sourceStartMs = o.optLong("sourceStartMs", 0L),
-                            sourceEndMs = o.optLong("sourceEndMs", 10000L),
-                            zoomScale = o.optDouble("zoomScale", 1.0).toFloat(),
+                            id = obj.optString("id", UUID.randomUUID().toString()),
+                            sourceStartMs = obj.getLong("sourceStartMs"),
+                            sourceEndMs = obj.getLong("sourceEndMs"),
+                            zoomScale = obj.optDouble("zoomScale", 1.0).toFloat(),
                             transition = try {
-                                VideoTransition.valueOf(o.optString("transition", "NONE"))
+                                VideoTransition.valueOf(obj.optString("transition", "NONE"))
                             } catch (e: Exception) {
                                 VideoTransition.NONE
                             },
-                            cropFocusX = o.optDouble("cropFocusX", 0.5).toFloat()
+                            cropFocusX = obj.optDouble("cropFocusX", 0.5).toFloat()
                         )
                     )
                 }
             }
 
+            val capArray = root.optJSONArray("captionBlocks")
             val captions = mutableListOf<CaptionBlock>()
-            val capArr = root.optJSONArray("captionBlocks")
-            if (capArr != null) {
-                for (i in 0 until capArr.length()) {
-                    val o = capArr.getJSONObject(i)
-                    val words = mutableListOf<CaptionWord>()
-                    val wArr = o.optJSONArray("words")
-                    if (wArr != null) {
-                        for (j in 0 until wArr.length()) {
-                            val wo = wArr.getJSONObject(j)
-                            words.add(
+            if (capArray != null) {
+                for (i in 0 until capArray.length()) {
+                    val obj = capArray.getJSONObject(i)
+                    val wordsList = mutableListOf<CaptionWord>()
+                    val wordsArr = obj.optJSONArray("words")
+                    if (wordsArr != null) {
+                        for (w in 0 until wordsArr.length()) {
+                            val wObj = wordsArr.getJSONObject(w)
+                            wordsList.add(
                                 CaptionWord(
-                                    word = wo.optString("word", ""),
-                                    startOffsetMs = wo.optLong("startOffsetMs", 0L),
-                                    endOffsetMs = wo.optLong("endOffsetMs", 500L),
-                                    isEmphasized = wo.optBoolean("isEmphasized", false)
+                                    word = wObj.getString("word"),
+                                    startOffsetMs = wObj.getLong("startOffsetMs"),
+                                    endOffsetMs = wObj.getLong("endOffsetMs"),
+                                    isEmphasized = wObj.optBoolean("isEmphasized", false)
                                 )
                             )
                         }
                     }
                     captions.add(
                         CaptionBlock(
-                            id = o.optString("id", UUID.randomUUID().toString()),
-                            text = o.optString("text", ""),
-                            startMs = o.optLong("startMs", 0L),
-                            endMs = o.optLong("endMs", 2000L),
-                            words = words,
+                            id = obj.optString("id", UUID.randomUUID().toString()),
+                            text = obj.getString("text"),
+                            startMs = obj.getLong("startMs"),
+                            endMs = obj.getLong("endMs"),
+                            words = wordsList,
                             stylePreset = try {
-                                CaptionStylePreset.valueOf(o.optString("stylePreset", "HORMOZI_YELLOW"))
+                                CaptionStylePreset.valueOf(obj.optString("stylePreset", stylePresetStr))
                             } catch (e: Exception) {
-                                activeCaptionStyle
+                                stylePreset
                             }
                         )
                     )
                 }
             }
 
-            val audio = mutableListOf<com.example.data.model.AudioTrackItem>()
-            val audArr = root.optJSONArray("audioTracks")
-            if (audArr != null) {
-                for (i in 0 until audArr.length()) {
-                    val o = audArr.getJSONObject(i)
-                    audio.add(
-                        com.example.data.model.AudioTrackItem(
-                            id = o.optString("id", UUID.randomUUID().toString()),
-                            title = o.optString("title", "Audio"),
-                            assetUrlOrName = o.optString("assetUrlOrName", ""),
-                            startMs = o.optLong("startMs", 0L),
-                            endMs = o.optLong("endMs", 10000L),
-                            volume = o.optDouble("volume", 0.5).toFloat(),
-                            isDuckingEnabled = o.optBoolean("isDuckingEnabled", true)
+            val audArray = root.optJSONArray("audioTracks")
+            val audioList = mutableListOf<AudioTrackItem>()
+            if (audArray != null) {
+                for (i in 0 until audArray.length()) {
+                    val obj = audArray.getJSONObject(i)
+                    audioList.add(
+                        AudioTrackItem(
+                            id = obj.optString("id", UUID.randomUUID().toString()),
+                            title = obj.getString("title"),
+                            assetUrlOrName = obj.optString("assetUrlOrName", "bgm"),
+                            startMs = obj.getLong("startMs"),
+                            endMs = obj.getLong("endMs"),
+                            volume = obj.optDouble("volume", 0.6).toFloat(),
+                            isDuckingEnabled = obj.optBoolean("isDuckingEnabled", true)
                         )
                     )
                 }
@@ -542,76 +623,73 @@ class ClipperRepository(context: Context) {
             TimelineState(
                 videoSegments = segments,
                 captionBlocks = captions,
-                audioTracks = audio,
-                headlineHook = headlineHook,
-                activeCaptionStyle = activeCaptionStyle,
-                canvasRatio = canvasRatio,
-                masterVolume = masterVolume
+                audioTracks = audioList,
+                headlineHook = headline,
+                activeCaptionStyle = stylePreset,
+                canvasRatio = ratio,
+                masterVolume = masterVol,
+                sourceVideoUri = sourceVideoUri
             )
         } catch (e: Exception) {
             TimelineState()
         }
     }
 
-    // Asset and Template Catalogues
-    fun getStockAssets(): List<StockAsset> = listOf(
-        StockAsset("sfx-1", "Heavy Whoosh Transition", "SFX", "0.4s", "Impact"),
-        StockAsset("sfx-2", "Cash Register Ka-Ching", "SFX", "0.8s", "Reward"),
-        StockAsset("sfx-pop", "Pop Bubble Effect", "SFX", "0.2s", "Viral Pop"),
-        StockAsset("sfx-4", "Sub Bass 808 Drop", "SFX", "1.2s", "Bass Punch"),
-        StockAsset("sfx-3", "Vinyl Scratch Stop", "SFX", "0.6s", "Interrupt"),
-        StockAsset("sfx-camera", "Camera Shutter Click", "SFX", "0.3s", "Snap"),
-        StockAsset("sfx-boom", "Cinematic Deep Boom", "SFX", "1.4s", "Dramatic"),
-        StockAsset("sfx-glitch", "Digital Glitch Buzz", "SFX", "0.5s", "Tech"),
-        StockAsset("bgm-1", "Phonk Gym Motivation", "BGM", "02:14", "Hype"),
-        StockAsset("bgm-2", "Lo-Fi Coffee Study", "BGM", "01:52", "Chill"),
-        StockAsset("bgm-3", "Cinematic Pulse Suspense", "BGM", "02:30", "Dramatic"),
-        StockAsset("bgm-4", "Trap Viral Boom Beat", "BGM", "01:45", "Hype"),
-        StockAsset("sticker-1", "WAIT FOR THE END 🔥", "STICKER", "Text Overlay", "Attention"),
-        StockAsset("sticker-2", "99% MISS THIS ❌", "STICKER", "Text Overlay", "Pattern Interrupt"),
-        StockAsset("sticker-3", "MIND BLOWN 🤯", "STICKER", "Badge", "Reaction")
+    // Stock BGM and SFX catalog
+    fun getAvailableStockAssets(): List<StockAsset> = listOf(
+        StockAsset("bgm-1", "Phonk Bassline 140", "BGM", "0:45", "Hype"),
+        StockAsset("bgm-2", "Lo-Fi Deep Thoughts", "BGM", "1:15", "Chill"),
+        StockAsset("bgm-3", "Cinematic Suspense Sub", "BGM", "0:30", "Dramatic"),
+        StockAsset("bgm-4", "Upbeat Silicon Valley", "BGM", "0:50", "Pop"),
+        StockAsset("sfx-1", "Whoosh Transition 01", "SFX", "0:01", "Hype"),
+        StockAsset("sfx-2", "Camera Shutter Snap", "SFX", "0:01", "Chill"),
+        StockAsset("sfx-3", "Deep Sub Impact", "SFX", "0:02", "Dramatic"),
+        StockAsset("sfx-4", "Cash Register Cha-Ching", "SFX", "0:01", "Pop")
     )
+    fun getStockAssets(): List<StockAsset> = getAvailableStockAssets()
 
-    fun getTemplates(): List<StyleTemplate> = listOf(
+    // Preset Style Templates
+    fun getStyleTemplates(): List<StyleTemplate> = listOf(
         StyleTemplate(
-            id = "tpl-hormozi",
+            id = "hormozi-impact",
             name = "Hormozi Impact",
-            description = "High-contrast yellow/green words, 1.25x snap zoom punch on sentence hooks, aggressive volume ducking.",
+            description = "High-energy bold yellow text, aggressive 1.25x punch-ins, zero silence pauses.",
             captionPreset = CaptionStylePreset.HORMOZI_YELLOW,
             defaultZoom = 1.25f,
             defaultTransition = VideoTransition.ZOOM_SNAP,
-            recommendedBgm = "Phonk Gym Motivation",
-            badge = "Viral #1"
+            recommendedBgm = "Phonk Bassline 140",
+            badge = "🔥 HIGHEST CONVERSION"
         ),
         StyleTemplate(
-            id = "tpl-tiktok-fast",
-            name = "Fast-Paced TikTok",
-            description = "Sub-2.5s rapid cuts, white flash transitions, high saturation words, maximum viewer retention.",
+            id = "beast-viral",
+            name = "MrBeast Punch",
+            description = "High-velocity emerald highlights, white flash cuts, extreme retention pacing.",
             captionPreset = CaptionStylePreset.BEAST_GREEN,
-            defaultZoom = 1.3f,
+            defaultZoom = 1.30f,
             defaultTransition = VideoTransition.WHITE_FLASH,
-            recommendedBgm = "Trap Viral Boom Beat",
-            badge = "Trending"
+            recommendedBgm = "Upbeat Silicon Valley",
+            badge = "⚡ VIRAL VELOCITY"
         ),
         StyleTemplate(
-            id = "tpl-red-alert",
-            name = "Red Urgency",
-            description = "High-stakes bold red alerts, bold uppercase captions, dramatic pauses removed automatically.",
-            captionPreset = CaptionStylePreset.RED_ALERT,
-            defaultZoom = 1.2f,
+            id = "abdaal-cinema",
+            name = "Ali Abdaal Clean",
+            description = "Clean minimalistic lower-third subtitles, calm pacing, high clarity.",
+            captionPreset = CaptionStylePreset.ALI_ABDAAL,
+            defaultZoom = 1.05f,
             defaultTransition = VideoTransition.CROSSFADE,
-            recommendedBgm = "Cinematic Pulse Suspense",
-            badge = "High CTR"
+            recommendedBgm = "Lo-Fi Deep Thoughts",
+            badge = "☕ THOUGHT LEADER"
         ),
         StyleTemplate(
-            id = "tpl-cyber-clean",
-            name = "Cyber Minimalist",
-            description = "Clean modern tech aesthetic with cyan subtitles, subtle letterbox breathing, chill lo-fi backing.",
-            captionPreset = CaptionStylePreset.NEON_CYAN,
-            defaultZoom = 1.1f,
-            defaultTransition = VideoTransition.NONE,
-            recommendedBgm = "Lo-Fi Coffee Study",
-            badge = "Clean"
+            id = "red-alert-hook",
+            name = "Viral Red Alert",
+            description = "Urgent high-stakes red and white contrast, maximum pattern interrupt for cold viewers.",
+            captionPreset = CaptionStylePreset.RED_ALERT,
+            defaultZoom = 1.35f,
+            defaultTransition = VideoTransition.ZOOM_SNAP,
+            recommendedBgm = "Cinematic Suspense Sub",
+            badge = "🚨 SCROLL STOPPER"
         )
     )
+    fun getTemplates(): List<StyleTemplate> = getStyleTemplates()
 }

@@ -83,6 +83,7 @@ fun NewProjectScreen(
     var aiInstructions by remember { mutableStateOf("Find the top high-conviction hooks and mindsets with intense emotional delivery.") }
     var resolutionAndSize by remember { mutableStateOf("1920x1080 • Auto 9:16 Smart Cropping") }
     var isUploadedFromDevice by remember { mutableStateOf(false) }
+    var selectedVideoUri by remember { mutableStateOf("") }
 
     val isScanning by viewModel.isScanningClips.collectAsState()
 
@@ -91,6 +92,13 @@ fun NewProjectScreen(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri: Uri? ->
         if (uri != null) {
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {}
+            selectedVideoUri = uri.toString()
             val (extractedName, extractedDur, info) = extractVideoInfo(context, uri)
             videoName = extractedName
             durationSec = extractedDur
@@ -109,6 +117,13 @@ fun NewProjectScreen(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {}
+            selectedVideoUri = uri.toString()
             val (extractedName, extractedDur, info) = extractVideoInfo(context, uri)
             videoName = extractedName
             durationSec = extractedDur
@@ -435,7 +450,8 @@ fun NewProjectScreen(
                     videoTitle = videoName,
                     durationSec = durationSec,
                     targetPlatform = selectedPlatform,
-                    userPrompt = aiInstructions
+                    userPrompt = aiInstructions,
+                    videoUri = selectedVideoUri
                 )
             },
             enabled = !isScanning && title.isNotBlank(),
