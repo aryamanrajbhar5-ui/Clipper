@@ -1,0 +1,6 @@
+{
+  "name": "AI Clipper Factory",
+  "description": "Smart short-form video clip generator and vertical editor for Reels, TikTok, and Shorts powered by Gemini BYOK.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

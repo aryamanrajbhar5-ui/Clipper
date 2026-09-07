@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 9:16 vertical phone frame in center -->
+    <path
+        android:pathData="M40,28 h28 c3.3,0 6,2.7 6,6 v40 c0,3.3 -2.7,6 -6,6 h-28 c-3.3,0 -6,-2.7 -6,-6 v-40 c0,-3.3 2.7,-6 6,-6 z"
+        android:strokeWidth="2.5"
+        android:strokeColor="#38BDF8"
+        android:fillColor="#151D33" />
+
+    <!-- Play arrow / Clip slice -->
+    <path
+        android:pathData="M49,43 L63,54 L49,65 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="49"
+                android:startY="43"
+                android:endX="63"
+                android:endY="65"
+                android:type="linear">
+                <item android:color="#38BDF8" android:offset="0.0" />
+                <item android:color="#818CF8" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Cutting scissors / slash accent -->
+    <path
+        android:pathData="M32,72 L76,36"
+        android:strokeWidth="3.2"
+        android:strokeColor="#F43F5E"
+        android:strokeLineCap="round" />
+
+    <!-- AI Sparkle top right -->
+    <path
+        android:pathData="M73,22 L75,27 L80,29 L75,31 L73,36 L71,31 L66,29 L71,27 Z"
+        android:fillColor="#FBBF24" />
+
+    <!-- AI Sparkle bottom left -->
+    <path
+        android:pathData="M31,76 L32.5,79.5 L36,81 L32.5,82.5 L31,86 L29.5,82.5 L26,81 L29.5,79.5 Z"
+        android:fillColor="#38BDF8" />
+</vector>
