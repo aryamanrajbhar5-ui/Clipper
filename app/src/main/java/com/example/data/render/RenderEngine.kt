@@ -1,7 +1,6 @@
 package com.example.data.render
 
 import android.content.Context
-import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -10,14 +9,13 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
-import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.net.Uri
 import android.view.Surface
+import com.example.data.audio.AudioProcessor
 import com.example.data.model.CaptionBlock
-import com.example.data.model.CaptionStylePreset
 import com.example.data.model.ExportJob
 import com.example.data.model.ExportStatus
 import com.example.data.model.TimelineState
@@ -25,68 +23,73 @@ import com.example.data.model.VideoSegment
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.nio.ByteBuffer
+import java.util.UUID
 
 /**
- * Android hardware-accelerated video rendering engine.
- * Transcodes real source video frames using MediaExtractor, MediaMetadataRetriever, MediaCodec (H.264/AVC),
- * and MediaMuxer into genuine 9:16 vertical MP4 files.
+ * Real MediaCodec & MediaMuxer hardware video and audio export engine.
  * 
- * Strict Pipeline Rules:
- * 1. Operates on the actual source video Uri/file.
- * 2. Trims and maps timeline video segments with sourceStartMs / sourceEndMs.
- * 3. Centers and crops/reframes source frames to 9:16 aspect ratio with cropFocusX panning.
- * 4. Applies zoom punch / scale adjustments per segment.
- * 5. Burns styled active caption blocks and top hook banners directly into video frames.
- * 6. Deletes writeFallbackMp4(): Never outputs dummy/fabricated bytes.
- * 7. If rendering fails or output is invalid, returns FAILED with the real error.
+ * Pipeline:
+ * 1. Inspect source video for real audio tracks.
+ * 2. If source video contains audio, extract and trim original audio matching exact timeline segment boundaries.
+ * 3. Transcode source video frames using MediaCodec (H.264/AVC) to vertical 9:16 canvas with smart reframing,
+ *    zoom punches, hook banners, and burned styled captions.
+ * 4. Interleave and mux video + original audio into final MP4 using MediaMuxer.
+ * 5. Strict post-export validation: ensures file exists, size > 0, contains video track, contains audio track,
+ *    and durations match expected clip bounds.
+ * 6. Safely cleans up intermediate temporary files and reports failures explicitly.
  */
 class RenderEngine(private val context: Context) {
 
     suspend fun renderMp4(
-        jobId: String,
+        jobId: String = UUID.randomUUID().toString(),
         projectId: String,
         clipTitle: String,
         timeline: TimelineState,
         sourceUriOrPath: String = "",
-        resolution: String = "1080x1920 (9:16)",
+        resolution: String = "1080x1920",
         fps: Int = 30,
-        onProgress: suspend (ExportStatus, Float, String, Long) -> Unit
+        onProgress: suspend (status: ExportStatus, progress: Float, outputPath: String, fileSize: Long) -> Unit
     ): ExportJob = withContext(Dispatchers.IO) {
-        val sanitizedTitle = clipTitle.replace(Regex("[^a-zA-Z0-9_]"), "_").take(25)
-        val fileName = "AI_Clipper_${sanitizedTitle}_${System.currentTimeMillis()}.mp4"
         val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
-        val outputFile = File(exportDir, fileName)
+        val outputFile = File(exportDir, "clipper_${jobId}.mp4")
+        val tempVideoFile = File(exportDir, "temp_video_${jobId}.mp4")
+        val tempAudioFile = File(exportDir, "temp_audio_${jobId}.m4a")
 
         try {
             onProgress(ExportStatus.ANALYZING, 0.05f, "", 0L)
 
-            // Resolve effective source video path or URI
-            val effectiveSource = sourceUriOrPath.ifBlank { timeline.sourceVideoUri }
-            if (effectiveSource.isBlank()) {
-                throw IllegalArgumentException("No source video provided for export rendering.")
+            // Resolve effective source video
+            val effectiveSource = when {
+                sourceUriOrPath.isNotBlank() -> sourceUriOrPath
+                timeline.sourceVideoUri.isNotBlank() -> timeline.sourceVideoUri
+                else -> ""
             }
 
-            // Verify source accessibility
+            if (effectiveSource.isBlank()) {
+                throw IllegalStateException("No source video provided for export rendering.")
+            }
+
+            // Verify source video readability
             val retriever = MediaMetadataRetriever()
             try {
                 if (effectiveSource.startsWith("content://")) {
-                    retriever.setDataSource(context, Uri.parse(effectiveSource))
+                    val uri = Uri.parse(effectiveSource)
+                    retriever.setDataSource(context, uri)
                 } else {
-                    val srcFile = File(effectiveSource)
-                    if (!srcFile.exists()) {
-                        throw IllegalArgumentException("Source video file does not exist: $effectiveSource")
+                    val file = File(effectiveSource)
+                    if (!file.exists()) {
+                        throw IllegalStateException("Source video file does not exist on disk: $effectiveSource")
                     }
-                    retriever.setDataSource(srcFile.absolutePath)
+                    retriever.setDataSource(file.absolutePath)
                 }
             } catch (e: Exception) {
-                throw IllegalStateException("Failed to open source video stream: ${e.message}", e)
+                try { retriever.release() } catch (_: Exception) {}
+                throw IllegalStateException("Source video could not be opened: ${e.message}", e)
             }
 
-            // Determine output resolution (9:16 vertical)
             val (targetWidth, targetHeight) = when {
-                resolution.startsWith("1080") -> Pair(1080, 1920)
-                resolution.startsWith("720") -> Pair(720, 1280)
+                resolution.contains("1080") -> Pair(1080, 1920)
+                resolution.contains("720") -> Pair(720, 1280)
                 else -> Pair(720, 1280)
             }
             val effectiveFps = fps.coerceIn(24, 60)
@@ -94,35 +97,81 @@ class RenderEngine(private val context: Context) {
             // Ensure timeline has video segments
             val segments = timeline.videoSegments
             if (segments.isEmpty()) {
+                try { retriever.release() } catch (_: Exception) {}
                 throw IllegalStateException("Timeline contains no video segments to render.")
             }
 
             val totalDurationMs = timeline.totalDurationMs.coerceAtLeast(500L)
 
-            onProgress(ExportStatus.SMART_CROPPING, 0.20f, "", 0L)
+            // 1. Inspect source video for real audio
+            val sourceHasAudio = AudioProcessor.hasAudioTrack(context, effectiveSource)
 
-            // Transcode real frames
-            val renderSuccess = renderNativeMp4(
+            // 2. If source video contains audio, extract and trim original audio for segments
+            if (sourceHasAudio) {
+                onProgress(ExportStatus.SMART_CROPPING, 0.15f, "", 0L)
+                val audioExtracted = AudioProcessor.extractAndTrimAudio(
+                    context = context,
+                    videoUriOrPath = effectiveSource,
+                    segments = segments,
+                    outputAudioFile = tempAudioFile
+                )
+                if (!audioExtracted || !tempAudioFile.exists() || tempAudioFile.length() == 0L) {
+                    if (tempAudioFile.exists()) tempAudioFile.delete()
+                    try { retriever.release() } catch (_: Exception) {}
+                    throw IllegalStateException("Audio pipeline failed: could not extract or trim original audio from source video.")
+                }
+            }
+
+            onProgress(ExportStatus.BURNING_CAPTIONS, 0.25f, "", 0L)
+
+            // 3. Transcode real video frames to temp video container
+            val renderVideoSuccess = renderNativeVideoFrames(
                 context = context,
                 retriever = retriever,
                 timeline = timeline,
-                outputFile = outputFile,
+                outputFile = tempVideoFile,
                 targetWidth = targetWidth,
                 targetHeight = targetHeight,
                 fps = effectiveFps,
                 totalDurationMs = totalDurationMs
             ) { progressStep ->
-                val mappedProgress = 0.20f + (progressStep * 0.75f)
+                val mappedProgress = 0.25f + (progressStep * 0.60f)
                 val status = if (progressStep < 0.5f) ExportStatus.BURNING_CAPTIONS else ExportStatus.ENCODING_MP4
                 onProgress(status, mappedProgress, "", 0L)
             }
 
-            if (!renderSuccess || !outputFile.exists() || outputFile.length() == 0L) {
-                if (outputFile.exists()) {
-                    outputFile.delete()
-                }
-                throw IllegalStateException("Video transcode pipeline failed to produce a valid MP4 file.")
+            if (!renderVideoSuccess || !tempVideoFile.exists() || tempVideoFile.length() == 0L) {
+                if (tempVideoFile.exists()) tempVideoFile.delete()
+                if (tempAudioFile.exists()) tempAudioFile.delete()
+                throw IllegalStateException("Video transcode pipeline failed to produce valid video frames.")
             }
+
+            // 4. Mux video and original audio into final MP4
+            onProgress(ExportStatus.ENCODING_MP4, 0.88f, "", 0L)
+            if (sourceHasAudio) {
+                val muxSuccess = AudioProcessor.muxVideoAndAudio(
+                    videoInputFile = tempVideoFile,
+                    audioInputFile = tempAudioFile,
+                    outputFile = outputFile
+                )
+                if (tempVideoFile.exists()) tempVideoFile.delete()
+                if (tempAudioFile.exists()) tempAudioFile.delete()
+                if (!muxSuccess || !outputFile.exists() || outputFile.length() == 0L) {
+                    if (outputFile.exists()) outputFile.delete()
+                    throw IllegalStateException("Muxing pipeline failed: unable to combine video and audio streams into final MP4.")
+                }
+            } else {
+                tempVideoFile.copyTo(outputFile, overwrite = true)
+                tempVideoFile.delete()
+            }
+
+            // 5. Strict validation of exported MP4 container
+            onProgress(ExportStatus.ENCODING_MP4, 0.95f, "", 0L)
+            AudioProcessor.validateExportedMp4(
+                outputFile = outputFile,
+                expectedDurationMs = totalDurationMs,
+                sourceHadAudio = sourceHasAudio
+            )
 
             val finalSize = outputFile.length()
             onProgress(ExportStatus.COMPLETED, 1.0f, outputFile.absolutePath, finalSize)
@@ -144,6 +193,12 @@ class RenderEngine(private val context: Context) {
             if (outputFile.exists()) {
                 try { outputFile.delete() } catch (_: Exception) {}
             }
+            if (tempVideoFile.exists()) {
+                try { tempVideoFile.delete() } catch (_: Exception) {}
+            }
+            if (tempAudioFile.exists()) {
+                try { tempAudioFile.delete() } catch (_: Exception) {}
+            }
             onProgress(ExportStatus.FAILED, 0f, "", 0L)
             ExportJob(
                 id = jobId,
@@ -160,7 +215,7 @@ class RenderEngine(private val context: Context) {
         }
     }
 
-    private suspend fun renderNativeMp4(
+    private suspend fun renderNativeVideoFrames(
         context: Context,
         retriever: MediaMetadataRetriever,
         timeline: TimelineState,
@@ -180,7 +235,6 @@ class RenderEngine(private val context: Context) {
                 1080 -> 8_000_000 // 8 Mbps for 1080p
                 else -> 4_000_000 // 4 Mbps for 720p
             }
-            val frameIntervalUs = 1_000_000L / fps
             val totalFrames = ((totalDurationMs * fps) / 1000L).toInt().coerceAtLeast(fps)
 
             // Setup H.264 Video Encoder
@@ -288,8 +342,8 @@ class RenderEngine(private val context: Context) {
                 } catch (_: Throwable) {}
 
                 if (!frameDrawn) {
-                    // Fallback to cinematic backdrop if frame decoder missed a sync frame
-                    canvas.drawColor(Color.parseColor("#0F172A"))
+                    inputSurface.unlockCanvasAndPost(canvas)
+                    throw IllegalStateException("Failed to decode source video frame at timestamp ${sourcePtsMs}ms.")
                 }
 
                 // 2. Render Headline Hook banner if set
@@ -400,4 +454,3 @@ class RenderEngine(private val context: Context) {
         }
     }
 }
-

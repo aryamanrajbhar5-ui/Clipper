@@ -76,7 +76,12 @@ class DefaultVideoAnalysisService(
 
             // Perform real speech transcription
             val transcriptResult = transcriptionService.transcribeVideo(videoUriOrPath, durationMs, apiKey)
-            val transcriptSegments = transcriptResult.getOrDefault(emptyList())
+            if (transcriptResult.isFailure) {
+                return@withContext Result.failure(
+                    transcriptResult.exceptionOrNull() ?: IllegalStateException("Speech transcription failed.")
+                )
+            }
+            val transcriptSegments = transcriptResult.getOrThrow()
 
             // Identify silence periods between speech segments
             val silenceIntervals = mutableListOf<Pair<Long, Long>>()

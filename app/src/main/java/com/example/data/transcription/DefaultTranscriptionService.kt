@@ -1,10 +1,9 @@
 package com.example.data.transcription
 
 import android.content.Context
-import android.media.MediaExtractor
-import android.media.MediaFormat
-import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.util.Base64
+import com.example.data.audio.AudioProcessor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -13,153 +12,156 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.InputStream
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
- * Real transcription implementation extracting audio stream parameters, media duration,
- * speech/audio cadences, and transcribing real timestamps.
- * 
- * - Removes fabricated synthetic hook sentences.
- * - Inspects actual audio track from the media source.
- * - Uses configured Gemini API with audio-grounded analysis to transcribe with real millisecond timestamps.
- * - If no provider or key is configured, returns Result.failure rather than fabricating data.
+ * Real transcription implementation extracting actual audio streams from media sources,
+ * sending the genuine audio content to Gemini's multimodal transcription engine, and returning
+ * accurate timestamped spoken segments without synthetic fallbacks.
+ *
+ * Requirements satisfied:
+ * - Extracts actual audio from imported video.
+ * - Sends actual audio content (Base64 inlineData audio/mp4) to configured Gemini model.
+ * - Never generates hard-coded or fake transcript sentences.
+ * - Preserves accurate startMs/endMs.
+ * - Handles videos with no speech or no audio track gracefully.
+ * - Handles transcription/API errors explicitly.
+ * - Caches successful results across sessions so the same video is not repeatedly transcribed.
  */
 class DefaultTranscriptionService(
     private val context: Context,
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(60, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(90, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .writeTimeout(90, TimeUnit.SECONDS)
         .build()
 ) : TranscriptionService {
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
+    // In-memory cache of transcripts by media cache key
+    private val memoryCache = ConcurrentHashMap<String, List<TranscriptSegment>>()
+
     override suspend fun transcribeVideo(
         videoUriOrPath: String,
         durationMs: Long,
-        apiKey: String
+        apiKey: String,
+        model: String
     ): Result<List<TranscriptSegment>> = withContext(Dispatchers.IO) {
         try {
-            val cleanKey = apiKey.trim()
-            if (cleanKey.isBlank()) {
-                // User directive: If no transcription provider is configured, return a clear failure instead of fabricated transcript data
-                return@withContext Result.failure(
-                    IllegalStateException("No transcription provider configured. Please configure your Gemini API Key in Settings to enable AI speech-to-text.")
-                )
-            }
-
             if (videoUriOrPath.isBlank()) {
                 return@withContext Result.failure(
                     IllegalArgumentException("No source video provided for transcription.")
                 )
             }
 
-            // Extract real duration and audio track metadata from the media source
-            var effectiveDurationMs = durationMs
-            var audioTrackCount = 0
-            var sampleRate = 44100
-            var channelCount = 2
-            var audioMime: String? = null
+            // 1. Check in-memory and persistent disk cache
+            val cacheKey = computeCacheKey(videoUriOrPath, durationMs)
+            val cachedMemory = memoryCache[cacheKey]
+            if (cachedMemory != null) {
+                return@withContext Result.success(cachedMemory)
+            }
 
-            val retriever = MediaMetadataRetriever()
-            val extractor = MediaExtractor()
-
-            try {
-                if (videoUriOrPath.startsWith("content://")) {
-                    val uri = Uri.parse(videoUriOrPath)
-                    retriever.setDataSource(context, uri)
-                    context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
-                        extractor.setDataSource(pfd.fileDescriptor)
-                    }
-                } else {
-                    val file = File(videoUriOrPath)
-                    if (file.exists()) {
-                        retriever.setDataSource(file.absolutePath)
-                        extractor.setDataSource(file.absolutePath)
-                    } else {
-                        // File path string provided but does not exist on disk
-                        return@withContext Result.failure(
-                            IllegalArgumentException("Source video file does not exist: $videoUriOrPath")
-                        )
-                    }
+            val diskCacheFile = getDiskCacheFile(cacheKey)
+            if (diskCacheFile.exists()) {
+                val loaded = readSegmentsFromDisk(diskCacheFile)
+                if (loaded != null) {
+                    memoryCache[cacheKey] = loaded
+                    return@withContext Result.success(loaded)
                 }
+            }
 
-                val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                durStr?.toLongOrNull()?.let { effectiveDurationMs = it }
-
-                // Inspect tracks for real audio stream
-                val numTracks = extractor.trackCount
-                for (i in 0 until numTracks) {
-                    val format = extractor.getTrackFormat(i)
-                    val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
-                    if (mime.startsWith("audio/")) {
-                        audioTrackCount++
-                        audioMime = mime
-                        if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
-                            sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                        }
-                        if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
-                            channelCount = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                // If media extraction fails completely
+            // 2. Validate Gemini API Key
+            val cleanKey = apiKey.trim()
+            if (cleanKey.isBlank()) {
                 return@withContext Result.failure(
-                    IllegalStateException("Failed to inspect media stream for audio transcription: ${e.message}", e)
+                    IllegalStateException("No transcription provider configured. Please configure your Gemini API Key in Settings to transcribe video audio.")
                 )
+            }
+
+            // 3. Check if source video contains an audio track
+            val hasAudio = AudioProcessor.hasAudioTrack(context, videoUriOrPath)
+            if (!hasAudio) {
+                // Video genuinely has no audio track. Handle gracefully with empty speech list.
+                val empty = emptyList<TranscriptSegment>()
+                memoryCache[cacheKey] = empty
+                saveSegmentsToDisk(diskCacheFile, empty)
+                return@withContext Result.success(empty)
+            }
+
+            // 4. Extract the actual audio stream from the media source
+            val cacheDir = File(context.cacheDir, "audio_transcribe").apply { mkdirs() }
+            val tempAudioFile = File(cacheDir, "extract_${UUID.randomUUID()}.m4a")
+
+            val extractionSuccess = AudioProcessor.extractFullAudio(context, videoUriOrPath, tempAudioFile)
+            if (!extractionSuccess || !tempAudioFile.exists() || tempAudioFile.length() == 0L) {
+                if (tempAudioFile.exists()) tempAudioFile.delete()
+                return@withContext Result.failure(
+                    IllegalStateException("Failed to extract audio track from video source for transcription.")
+                )
+            }
+
+            // 5. Read actual audio bytes and prepare Base64 payload for Gemini
+            val audioBytes = try {
+                tempAudioFile.readBytes()
             } finally {
-                try { retriever.release() } catch (_: Exception) {}
-                try { extractor.release() } catch (_: Exception) {}
+                // Clean up temporary audio extraction file safely
+                if (tempAudioFile.exists()) {
+                    try { tempAudioFile.delete() } catch (_: Exception) {}
+                }
             }
 
-            if (effectiveDurationMs <= 0L) {
-                return@withContext Result.failure(
-                    IllegalStateException("Source video has zero duration or could not be read.")
-                )
+            if (audioBytes.isEmpty()) {
+                val empty = emptyList<TranscriptSegment>()
+                memoryCache[cacheKey] = empty
+                saveSegmentsToDisk(diskCacheFile, empty)
+                return@withContext Result.success(empty)
             }
 
+            val base64Audio = Base64.encodeToString(audioBytes, Base64.NO_WRAP)
 
-            // Real audio analysis via Gemini API
+            // 6. Transcribe using Gemini Multimodal Audio Model
+            val effectiveModel = if (model.isNotBlank()) model else "gemini-2.5-flash"
             val promptText = """
-                You are a professional speech-to-text transcriber for video editing.
-                The video has an active audio track ($audioMime, ${sampleRate}Hz, $channelCount channels) with total duration ${effectiveDurationMs}ms (${effectiveDurationMs / 1000}s).
-                
-                Generate a millisecond-precision speech transcript reflecting realistic spoken cadence for a video of duration ${effectiveDurationMs}ms.
-                
-                STRICT RULES:
-                1. Each segment must have:
-                   - "startMs": Long >= 0
-                   - "endMs": Long > startMs and <= $effectiveDurationMs
-                   - "text": The spoken sentence
-                   - "confidence": Float between 0.85 and 1.0
-                2. Timestamps must be chronologically ordered and contiguous without overlapping.
-                3. Segment durations should typically be 2000ms to 6000ms.
-                4. Output strictly a JSON array of segment objects. No markdown formatting.
-                
-                Example schema:
-                [
-                  {"startMs": 1000, "endMs": 4200, "text": "Sentence spoken here.", "confidence": 0.96}
-                ]
+                You are an expert speech-to-text audio transcriber.
+                Carefully listen to the attached audio recording and transcribe all spoken words with millisecond timestamps.
+
+                Output a strictly valid JSON array of segment objects, ordered chronologically.
+                Each object must match this schema:
+                {
+                  "startMs": <start time in milliseconds as integer>,
+                  "endMs": <end time in milliseconds as integer>,
+                  "text": "<exact spoken words in this segment>",
+                  "confidence": <confidence score between 0.0 and 1.0>
+                }
+
+                CRITICAL INSTRUCTIONS:
+                1. "startMs" and "endMs" must be non-negative integers representing the exact millisecond timestamps when speech occurs.
+                2. Group speech naturally into 1-2 spoken sentences per segment (typically 2000ms to 6000ms long).
+                3. If there is NO speech in the audio (for example silence, ambient noise, sound effects, or purely instrumental music with no spoken words), return an empty JSON array: []
+                4. Return ONLY the raw JSON array. Do not include markdown formatting or commentary.
             """.trimIndent()
 
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$cleanKey"
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/$effectiveModel:generateContent?key=$cleanKey"
             val requestJson = JSONObject().apply {
                 val contents = JSONArray().apply {
                     put(JSONObject().apply {
                         val parts = JSONArray().apply {
                             put(JSONObject().put("text", promptText))
+                            put(JSONObject().put("inlineData", JSONObject().apply {
+                                put("mimeType", "audio/mp4")
+                                put("data", base64Audio)
+                            }))
                         }
                         put("parts", parts)
                     })
                 }
                 put("contents", contents)
                 put("generationConfig", JSONObject().apply {
-                    put("temperature", 0.2)
+                    put("temperature", 0.0)
                     put("responseMimeType", "application/json")
                 })
             }
@@ -179,7 +181,7 @@ class DefaultTranscriptionService(
                     "HTTP ${response.code}: ${response.message}"
                 }
                 return@withContext Result.failure(
-                    IllegalStateException("Transcription service error: $errMessage")
+                    IllegalStateException("Gemini transcription API error: $errMessage")
                 )
             }
 
@@ -194,38 +196,92 @@ class DefaultTranscriptionService(
             val cleanJson = candidateText.trim()
                 .removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
 
-            val array = JSONArray(cleanJson)
             val segments = mutableListOf<TranscriptSegment>()
+            if (cleanJson.isNotBlank() && cleanJson != "[]") {
+                val array = JSONArray(cleanJson)
+                for (i in 0 until array.length()) {
+                    val obj = array.getJSONObject(i)
+                    val start = obj.optLong("startMs", -1L)
+                    val end = obj.optLong("endMs", -1L)
+                    val text = obj.optString("text", "").trim()
+                    val confidence = obj.optDouble("confidence", 0.95).toFloat()
 
-            for (i in 0 until array.length()) {
-                val obj = array.getJSONObject(i)
-                val start = obj.optLong("startMs", -1L)
-                val end = obj.optLong("endMs", -1L)
-                val text = obj.optString("text", "").trim()
-                val confidence = obj.optDouble("confidence", 0.95).toFloat()
-
-                if (start >= 0L && end > start && end <= effectiveDurationMs && text.isNotBlank()) {
-                    segments.add(
-                        TranscriptSegment(
-                            startMs = start,
-                            endMs = end,
-                            text = text,
-                            confidence = confidence
+                    if (start >= 0L && end > start && text.isNotBlank()) {
+                        segments.add(
+                            TranscriptSegment(
+                                startMs = start,
+                                endMs = end,
+                                text = text,
+                                confidence = confidence
+                            )
                         )
-                    )
+                    }
                 }
             }
 
-            if (segments.isEmpty()) {
-                return@withContext Result.failure(
-                    IllegalStateException("Transcription did not produce any valid timestamped speech segments.")
-                )
-            }
+            // 7. Cache successful transcription
+            memoryCache[cacheKey] = segments
+            saveSegmentsToDisk(diskCacheFile, segments)
 
             Result.success(segments)
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
-}
 
+    private fun computeCacheKey(videoUriOrPath: String, durationMs: Long): String {
+        return if (videoUriOrPath.startsWith("content://")) {
+            val uri = Uri.parse(videoUriOrPath)
+            "tx_content_${uri.lastPathSegment.hashCode()}_${durationMs}"
+        } else {
+            val file = File(videoUriOrPath)
+            if (file.exists()) {
+                "tx_file_${file.name.hashCode()}_${file.length()}_${file.lastModified()}"
+            } else {
+                "tx_path_${videoUriOrPath.hashCode()}_${durationMs}"
+            }
+        }
+    }
+
+    private fun getDiskCacheFile(cacheKey: String): File {
+        val dir = File(context.cacheDir, "transcripts").apply { mkdirs() }
+        return File(dir, "$cacheKey.json")
+    }
+
+    private fun saveSegmentsToDisk(file: File, segments: List<TranscriptSegment>) {
+        try {
+            val arr = JSONArray()
+            for (seg in segments) {
+                arr.put(JSONObject().apply {
+                    put("startMs", seg.startMs)
+                    put("endMs", seg.endMs)
+                    put("text", seg.text)
+                    put("confidence", seg.confidence.toDouble())
+                })
+            }
+            file.writeText(arr.toString())
+        } catch (_: Exception) {}
+    }
+
+    private fun readSegmentsFromDisk(file: File): List<TranscriptSegment>? {
+        return try {
+            val text = file.readText()
+            val arr = JSONArray(text)
+            val list = mutableListOf<TranscriptSegment>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                list.add(
+                    TranscriptSegment(
+                        startMs = obj.getLong("startMs"),
+                        endMs = obj.getLong("endMs"),
+                        text = obj.getString("text"),
+                        confidence = obj.optDouble("confidence", 0.95).toFloat()
+                    )
+                )
+            }
+            list
+        } catch (_: Exception) {
+            null
+        }
+    }
+}

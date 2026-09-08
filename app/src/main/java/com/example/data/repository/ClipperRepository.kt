@@ -179,23 +179,19 @@ class ClipperRepository(private val context: Context) {
 
         // 1. Get or compute real media analysis & timestamped transcript
         val cacheKey = if (project.videoUri.isNotBlank()) project.videoUri else project.id
-        val analysis = analysisCache.getOrPut(cacheKey) {
+        val cachedAnalysis = analysisCache[cacheKey]
+        val analysis = if (cachedAnalysis != null) {
+            cachedAnalysis
+        } else {
             val analysisRes = videoAnalysisService.analyzeVideo(project.videoUri, key)
-            analysisRes.getOrNull() ?: VideoAnalysisResult(
-                durationMs = project.videoDurationSec * 1000L,
-                width = 1920,
-                height = 1080,
-                frameRate = 30f,
-                fileSizeBytes = 0L,
-                transcriptSegments = transcriptionService.transcribeVideo(project.videoUri, project.videoDurationSec * 1000L, key).getOrDefault(emptyList()),
-                visualAnalysis = com.example.data.transcription.VideoVisualAnalysis(
-                    detectedScenesCount = (project.videoDurationSec / 8).coerceAtLeast(2),
-                    dominantFraming = "Center Headshot (16:9)",
-                    motionIntensity = "Dynamic",
-                    silenceIntervals = emptyList(),
-                    summary = "Real video analyzed: ${project.videoTitle}"
+            if (analysisRes.isFailure) {
+                return Result.failure(
+                    analysisRes.exceptionOrNull() ?: IllegalStateException("Failed to analyze media stream")
                 )
-            )
+            }
+            val res = analysisRes.getOrThrow()
+            analysisCache[cacheKey] = res
+            res
         }
 
         // 2. Formulate discovery request with genuine timestamped transcript & visual information

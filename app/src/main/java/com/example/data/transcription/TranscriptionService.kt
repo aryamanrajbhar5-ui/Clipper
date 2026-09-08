@@ -36,6 +36,7 @@ interface TranscriptionService {
     suspend fun transcribeVideo(
         videoUriOrPath: String,
         durationMs: Long,
-        apiKey: String = ""
+        apiKey: String = "",
+        model: String = "gemini-2.5-flash"
     ): Result<List<TranscriptSegment>>
 }
