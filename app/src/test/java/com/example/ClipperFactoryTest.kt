@@ -113,32 +113,53 @@ class ClipperFactoryTest {
     }
 
     @Test
-    fun testRenderEngine_generatesMp4Export() = runBlocking {
+    fun testRenderEngine_failsClearlyWhenNoSourceProvided() = runBlocking {
         val engine = RenderEngine(context)
         val timeline = TimelineState(
             videoSegments = listOf(
                 VideoSegment("s1", 0L, 8000L, 1.25f, VideoTransition.ZOOM_SNAP),
                 VideoSegment("s2", 8000L, 15000L, 1.05f, VideoTransition.NONE)
-            )
+            ),
+            sourceVideoUri = ""
         )
 
-        var completedStatus: ExportStatus? = null
+        var failureReported = false
         val job = engine.renderMp4(
             jobId = UUID.randomUUID().toString(),
             projectId = "proj-test",
             clipTitle = "Viral Short Test",
             timeline = timeline,
+            sourceUriOrPath = "",
             resolution = "1080x1920 (9:16)",
             fps = 60
-        ) { status, progress, _, _ ->
-            if (status == ExportStatus.COMPLETED) {
-                completedStatus = status
+        ) { status, _, _, _ ->
+            if (status == ExportStatus.FAILED) {
+                failureReported = true
             }
         }
 
-        assertEquals(ExportStatus.COMPLETED, job.status)
-        assertEquals(1.0f, job.progress)
-        assertTrue(job.fileSizeBytes > 0)
-        assertTrue(job.outputFilePath.endsWith(".mp4"))
+        // Must fail with FAILED and empty path instead of generating fake bytes
+        assertEquals(ExportStatus.FAILED, job.status)
+        assertEquals(0f, job.progress)
+        assertEquals(0L, job.fileSizeBytes)
+        assertTrue(job.outputFilePath.isEmpty())
+        assertTrue(failureReported)
+    }
+
+    @Test
+    fun testTranscriptionService_failsWhenNoApiKeyConfigured() = runBlocking {
+        val service = com.example.data.transcription.DefaultTranscriptionService(context)
+        val result = service.transcribeVideo(
+            videoUriOrPath = "content://media/external/video/media/1",
+            durationMs = 30000L,
+            apiKey = ""
+        )
+
+        // Must fail clearly rather than returning fabricated synthetic hook sentences
+        assertTrue(result.isFailure)
+        val exception = result.exceptionOrNull()
+        assertNotNull(exception)
+        assertTrue(exception!!.message!!.contains("No transcription provider configured") || exception.message!!.contains("Gemini API Key"))
     }
 }
+

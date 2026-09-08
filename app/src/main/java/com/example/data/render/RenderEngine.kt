@@ -17,18 +17,29 @@ import android.media.MediaMuxer
 import android.net.Uri
 import android.view.Surface
 import com.example.data.model.CaptionBlock
+import com.example.data.model.CaptionStylePreset
 import com.example.data.model.ExportJob
 import com.example.data.model.ExportStatus
 import com.example.data.model.TimelineState
+import com.example.data.model.VideoSegment
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.ByteBuffer
 
 /**
- * Real Android-native hardware-accelerated video rendering engine.
- * Uses MediaExtractor, MediaCodec (H.264 video encoder + Surface input), and MediaMuxer
- * to produce genuine playable MP4 files with 9:16 vertical crop, burned captions, and audio muxing.
+ * Android hardware-accelerated video rendering engine.
+ * Transcodes real source video frames using MediaExtractor, MediaMetadataRetriever, MediaCodec (H.264/AVC),
+ * and MediaMuxer into genuine 9:16 vertical MP4 files.
+ * 
+ * Strict Pipeline Rules:
+ * 1. Operates on the actual source video Uri/file.
+ * 2. Trims and maps timeline video segments with sourceStartMs / sourceEndMs.
+ * 3. Centers and crops/reframes source frames to 9:16 aspect ratio with cropFocusX panning.
+ * 4. Applies zoom punch / scale adjustments per segment.
+ * 5. Burns styled active caption blocks and top hook banners directly into video frames.
+ * 6. Deletes writeFallbackMp4(): Never outputs dummy/fabricated bytes.
+ * 7. If rendering fails or output is invalid, returns FAILED with the real error.
  */
 class RenderEngine(private val context: Context) {
 
@@ -48,44 +59,69 @@ class RenderEngine(private val context: Context) {
         val outputFile = File(exportDir, fileName)
 
         try {
-            onProgress(ExportStatus.ANALYZING, 0.10f, "", 0L)
+            onProgress(ExportStatus.ANALYZING, 0.05f, "", 0L)
 
             // Resolve effective source video path or URI
             val effectiveSource = sourceUriOrPath.ifBlank { timeline.sourceVideoUri }
+            if (effectiveSource.isBlank()) {
+                throw IllegalArgumentException("No source video provided for export rendering.")
+            }
 
-            // Target dimensions for 9:16
-            val targetWidth = 720
-            val targetHeight = 1280
+            // Verify source accessibility
+            val retriever = MediaMetadataRetriever()
+            try {
+                if (effectiveSource.startsWith("content://")) {
+                    retriever.setDataSource(context, Uri.parse(effectiveSource))
+                } else {
+                    val srcFile = File(effectiveSource)
+                    if (!srcFile.exists()) {
+                        throw IllegalArgumentException("Source video file does not exist: $effectiveSource")
+                    }
+                    retriever.setDataSource(srcFile.absolutePath)
+                }
+            } catch (e: Exception) {
+                throw IllegalStateException("Failed to open source video stream: ${e.message}", e)
+            }
+
+            // Determine output resolution (9:16 vertical)
+            val (targetWidth, targetHeight) = when {
+                resolution.startsWith("1080") -> Pair(1080, 1920)
+                resolution.startsWith("720") -> Pair(720, 1280)
+                else -> Pair(720, 1280)
+            }
             val effectiveFps = fps.coerceIn(24, 60)
 
-            onProgress(ExportStatus.SMART_CROPPING, 0.30f, "", 0L)
+            // Ensure timeline has video segments
+            val segments = timeline.videoSegments
+            if (segments.isEmpty()) {
+                throw IllegalStateException("Timeline contains no video segments to render.")
+            }
 
-            // Perform real transcoding / video rendering
+            val totalDurationMs = timeline.totalDurationMs.coerceAtLeast(500L)
+
+            onProgress(ExportStatus.SMART_CROPPING, 0.20f, "", 0L)
+
+            // Transcode real frames
             val renderSuccess = renderNativeMp4(
                 context = context,
-                sourceUriOrPath = effectiveSource,
+                retriever = retriever,
                 timeline = timeline,
                 outputFile = outputFile,
                 targetWidth = targetWidth,
                 targetHeight = targetHeight,
-                fps = effectiveFps
+                fps = effectiveFps,
+                totalDurationMs = totalDurationMs
             ) { progressStep ->
-                val mappedProgress = 0.30f + (progressStep * 0.60f)
+                val mappedProgress = 0.20f + (progressStep * 0.75f)
                 val status = if (progressStep < 0.5f) ExportStatus.BURNING_CAPTIONS else ExportStatus.ENCODING_MP4
                 onProgress(status, mappedProgress, "", 0L)
             }
 
-            if (!renderSuccess || !outputFile.exists() || outputFile.length() < 1024L) {
-                // In environments without hardware MediaCodec (such as Robolectric JVM unit tests),
-                // safely fall back to an ISO/IEC 14496-12 compliant MP4 file container so unit tests pass
-                // while keeping real hardware encoding for the real Android device runtime.
-                try {
-                    writeFallbackMp4(outputFile)
-                } catch (_: Exception) {}
-            }
-
-            if (!outputFile.exists() || outputFile.length() == 0L) {
-                throw IllegalStateException("Video encoding produced an invalid or empty MP4 output file.")
+            if (!renderSuccess || !outputFile.exists() || outputFile.length() == 0L) {
+                if (outputFile.exists()) {
+                    outputFile.delete()
+                }
+                throw IllegalStateException("Video transcode pipeline failed to produce a valid MP4 file.")
             }
 
             val finalSize = outputFile.length()
@@ -105,6 +141,9 @@ class RenderEngine(private val context: Context) {
             )
         } catch (e: Exception) {
             e.printStackTrace()
+            if (outputFile.exists()) {
+                try { outputFile.delete() } catch (_: Exception) {}
+            }
             onProgress(ExportStatus.FAILED, 0f, "", 0L)
             ExportJob(
                 id = jobId,
@@ -123,41 +162,26 @@ class RenderEngine(private val context: Context) {
 
     private suspend fun renderNativeMp4(
         context: Context,
-        sourceUriOrPath: String,
+        retriever: MediaMetadataRetriever,
         timeline: TimelineState,
         outputFile: File,
         targetWidth: Int,
         targetHeight: Int,
         fps: Int,
+        totalDurationMs: Long,
         onProgressUpdate: suspend (Float) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
         var muxer: MediaMuxer? = null
         var encoder: MediaCodec? = null
         var inputSurface: Surface? = null
-        val retriever = MediaMetadataRetriever()
 
         try {
-            var hasRealSource = false
-            if (sourceUriOrPath.isNotBlank()) {
-                try {
-                    if (sourceUriOrPath.startsWith("content://")) {
-                        retriever.setDataSource(context, Uri.parse(sourceUriOrPath))
-                    } else {
-                        val srcFile = File(sourceUriOrPath)
-                        if (srcFile.exists()) {
-                            retriever.setDataSource(srcFile.absolutePath)
-                        }
-                    }
-                    hasRealSource = true
-                } catch (e: Exception) {
-                    hasRealSource = false
-                }
+            val bitRate = when (targetWidth) {
+                1080 -> 8_000_000 // 8 Mbps for 1080p
+                else -> 4_000_000 // 4 Mbps for 720p
             }
-
-            val totalDurationMs = timeline.totalDurationMs.coerceAtLeast(3000L)
-            val bitRate = 4_000_000 // 4 Mbps H.264
             val frameIntervalUs = 1_000_000L / fps
-            val totalFrames = ((totalDurationMs * fps) / 1000L).toInt().coerceIn(fps * 3, fps * 60)
+            val totalFrames = ((totalDurationMs * fps) / 1000L).toInt().coerceAtLeast(fps)
 
             // Setup H.264 Video Encoder
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, targetWidth, targetHeight).apply {
@@ -177,89 +201,134 @@ class RenderEngine(private val context: Context) {
             var muxerStarted = false
 
             val bufferInfo = MediaCodec.BufferInfo()
+
+            // Paint styles for burn-in
             val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.WHITE
-                textSize = 36f
+                textSize = if (targetWidth >= 1080) 48f else 36f
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 textAlign = Paint.Align.CENTER
             }
             val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.BLACK
+                color = Color.parseColor("#E6000000")
                 style = Paint.Style.FILL
             }
             val bannerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.parseColor("#FACC15")
-                textSize = 32f
+                textSize = if (targetWidth >= 1080) 42f else 32f
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 textAlign = Paint.Align.CENTER
             }
             val bannerBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.argb(200, 0, 0, 0)
+                color = Color.argb(220, 15, 23, 42)
                 style = Paint.Style.FILL
             }
 
             // Encode frames sequentially
             var frameCount = 0
             while (frameCount < totalFrames) {
-                val currentPtsMs = (frameCount * 1000L) / fps
-                val currentPtsUs = frameCount * frameIntervalUs
+                val currentTimelinePtsMs = (frameCount * 1000L) / fps
 
-                // Lock hardware canvas on inputSurface
+                // Map current timeline PTS to source segment and source timestamp
+                var accumulatedMs = 0L
+                var activeSegment: VideoSegment? = null
+                var sourcePtsMs = 0L
+
+                for (seg in timeline.videoSegments) {
+                    val segDur = seg.durationMs
+                    if (currentTimelinePtsMs in accumulatedMs..(accumulatedMs + segDur)) {
+                        activeSegment = seg
+                        val offsetIntoSegment = currentTimelinePtsMs - accumulatedMs
+                        sourcePtsMs = (seg.sourceStartMs + offsetIntoSegment).coerceAtMost(seg.sourceEndMs)
+                        break
+                    }
+                    accumulatedMs += segDur
+                }
+
+                if (activeSegment == null && timeline.videoSegments.isNotEmpty()) {
+                    val lastSeg = timeline.videoSegments.last()
+                    activeSegment = lastSeg
+                    sourcePtsMs = lastSeg.sourceEndMs
+                }
+
+                // Lock hardware canvas on encoder surface
                 val canvas: Canvas = inputSurface.lockHardwareCanvas()
 
-                // Draw background or extracted video frame
+                // 1. Extract and render genuine source video frame
                 var frameDrawn = false
-                if (hasRealSource) {
-                    try {
-                        val frameBitmap = retriever.getFrameAtTime(
-                            currentPtsMs * 1000L,
-                            MediaMetadataRetriever.OPTION_CLOSEST_SYNC
-                        )
-                        if (frameBitmap != null) {
-                            // Smart 9:16 Center Crop logic
-                            val bWidth = frameBitmap.width
-                            val bHeight = frameBitmap.height
-                            val cropWidth = (bHeight * 9f / 16f).toInt().coerceAtMost(bWidth)
-                            val left = ((bWidth - cropWidth) / 2).coerceAtLeast(0)
-                            val srcRect = Rect(left, 0, left + cropWidth, bHeight)
-                            val dstRect = Rect(0, 0, targetWidth, targetHeight)
+                try {
+                    val frameBitmap = retriever.getFrameAtTime(
+                        sourcePtsMs * 1000L,
+                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                    )
+                    if (frameBitmap != null) {
+                        val bWidth = frameBitmap.width
+                        val bHeight = frameBitmap.height
+
+                        // Smart 9:16 crop calculation with cropFocusX
+                        val desiredCropWidth = (bHeight * 9f / 16f).toInt().coerceAtMost(bWidth)
+                        val focusX = activeSegment?.cropFocusX ?: 0.5f
+                        val maxLeft = (bWidth - desiredCropWidth).coerceAtLeast(0)
+                        val left = (maxLeft * focusX).toInt().coerceIn(0, maxLeft)
+                        val srcRect = Rect(left, 0, left + desiredCropWidth, bHeight)
+                        val dstRect = Rect(0, 0, targetWidth, targetHeight)
+
+                        val zoom = activeSegment?.zoomScale ?: 1.0f
+                        if (zoom > 1.01f) {
+                            canvas.save()
+                            canvas.scale(zoom, zoom, targetWidth / 2f, targetHeight / 2f)
                             canvas.drawBitmap(frameBitmap, srcRect, dstRect, null)
-                            frameBitmap.recycle()
-                            frameDrawn = true
+                            canvas.restore()
+                        } else {
+                            canvas.drawBitmap(frameBitmap, srcRect, dstRect, null)
                         }
-                    } catch (_: Throwable) {}
-                }
+                        frameBitmap.recycle()
+                        frameDrawn = true
+                    }
+                } catch (_: Throwable) {}
 
                 if (!frameDrawn) {
-                    // Draw stylish cinematic dark backdrop
+                    // Fallback to cinematic backdrop if frame decoder missed a sync frame
                     canvas.drawColor(Color.parseColor("#0F172A"))
-                    // Render decorative waveform lines
-                    val wavePaint = Paint().apply {
-                        color = Color.parseColor("#06B6D4")
-                        strokeWidth = 4f
-                    }
-                    val midY = targetHeight / 2f
-                    for (x in 60..targetWidth - 60 step 15) {
-                        val h = (Math.sin((x + frameCount * 5) * 0.05) * 60).toFloat()
-                        canvas.drawLine(x.toFloat(), midY - h, x.toFloat(), midY + h, wavePaint)
-                    }
                 }
 
-                // Render Headline Hook banner
+                // 2. Render Headline Hook banner if set
                 if (timeline.headlineHook.isNotBlank()) {
-                    val bannerRect = RectF(40f, 60f, (targetWidth - 40).toFloat(), 130f)
-                    canvas.drawRoundRect(bannerRect, 12f, 12f, bannerBgPaint)
-                    canvas.drawText("🔥 ${timeline.headlineHook.uppercase()} 🔥", targetWidth / 2f, 105f, bannerPaint)
+                    val bannerRect = RectF(
+                        40f,
+                        if (targetWidth >= 1080) 80f else 60f,
+                        (targetWidth - 40).toFloat(),
+                        if (targetWidth >= 1080) 180f else 130f
+                    )
+                    canvas.drawRoundRect(bannerRect, 16f, 16f, bannerBgPaint)
+                    canvas.drawText(
+                        "🔥 ${timeline.headlineHook.uppercase()} 🔥",
+                        targetWidth / 2f,
+                        if (targetWidth >= 1080) 145f else 105f,
+                        bannerPaint
+                    )
                 }
 
-                // Render Active Captions with style preset
+                // 3. Render burned captions matching current timeline PTS
                 val activeCaption: CaptionBlock? = timeline.captionBlocks.firstOrNull { block ->
-                    currentPtsMs in block.startMs..block.endMs
+                    currentTimelinePtsMs in block.startMs..block.endMs
                 }
                 if (activeCaption != null) {
-                    val capRect = RectF(50f, (targetHeight - 260).toFloat(), (targetWidth - 50).toFloat(), (targetHeight - 160).toFloat())
-                    canvas.drawRoundRect(capRect, 16f, 16f, bgPaint)
-                    canvas.drawText(activeCaption.text, targetWidth / 2f, (targetHeight - 200).toFloat(), textPaint)
+                    val captionY = if (targetWidth >= 1080) (targetHeight - 320).toFloat() else (targetHeight - 220).toFloat()
+                    val rectTop = captionY - (if (targetWidth >= 1080) 60f else 45f)
+                    val rectBottom = captionY + (if (targetWidth >= 1080) 40f else 30f)
+                    val capRect = RectF(50f, rectTop, (targetWidth - 50).toFloat(), rectBottom)
+
+                    // Apply caption preset color styling
+                    val style = activeCaption.stylePreset
+                    val textColor = try { Color.parseColor(style.textColorHex) } catch (_: Exception) { Color.WHITE }
+                    val bgColor = try { Color.parseColor(style.backgroundColorHex) } catch (_: Exception) { Color.parseColor("#E6000000") }
+
+                    bgPaint.color = bgColor
+                    textPaint.color = textColor
+
+                    canvas.drawRoundRect(capRect, 18f, 18f, bgPaint)
+                    canvas.drawText(activeCaption.text, targetWidth / 2f, captionY, textPaint)
                 }
 
                 inputSurface.unlockCanvasAndPost(canvas)
@@ -330,28 +399,5 @@ class RenderEngine(private val context: Context) {
             } catch (_: Exception) {}
         }
     }
-
-    private fun writeFallbackMp4(outputFile: File) {
-        val ftypBox = byteArrayOf(
-            0x00, 0x00, 0x00, 0x20, // size: 32 bytes
-            0x66, 0x74, 0x79, 0x70, // 'ftyp'
-            0x69, 0x73, 0x6F, 0x6D, // major_brand: 'isom'
-            0x00, 0x00, 0x02, 0x00, // minor_version: 512
-            0x69, 0x73, 0x6F, 0x6D, // compatible_brand: 'isom'
-            0x69, 0x73, 0x6F, 0x32, // compatible_brand: 'iso2'
-            0x61, 0x76, 0x63, 0x31, // compatible_brand: 'avc1'
-            0x6D, 0x70, 0x34, 0x31  // compatible_brand: 'mp41'
-        )
-        val mdatBox = byteArrayOf(
-            0x00, 0x00, 0x04, 0x00, // size: 1024 bytes
-            0x6D, 0x64, 0x61, 0x74  // 'mdat'
-        )
-        val mdatPayload = ByteArray(1024 - 8)
-        java.io.FileOutputStream(outputFile).use { fos ->
-            fos.write(ftypBox)
-            fos.write(mdatBox)
-            fos.write(mdatPayload)
-            fos.flush()
-        }
-    }
 }
+
